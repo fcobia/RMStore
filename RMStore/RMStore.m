@@ -538,7 +538,9 @@ typedef void (^RMStoreSuccessBlock)();
         [self.store addProduct:product];
     }
     
-    for (NSString *invalid in invalidProductIdentifiers)
+	NSString *invalid;
+#pragma unused(invalid)
+    for (invalid in invalidProductIdentifiers)
     {
         RMStoreLog(@"invalid product with id %@", invalid);
     }
