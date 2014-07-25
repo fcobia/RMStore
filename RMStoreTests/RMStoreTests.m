@@ -38,6 +38,21 @@ extern NSString* const RMStoreNotificationStoreError;
 
 @end
 
+@interface RMStoreContentDownloaderSuccess : NSObject<RMStoreContentDownloader>
+@end
+
+@interface RMStoreContentDownloaderProgress : NSObject<RMStoreContentDownloader>
+
+@property (nonatomic, assign) float progress;
+
+@end
+
+@interface RMStoreContentDownloaderFailure : NSObject<RMStoreContentDownloader>
+
+@property (nonatomic, strong) NSError *error;
+
+@end
+
 @interface RMStoreReceiptVerificatorSuccess : NSObject<RMStoreReceiptVerificator>
 @end
 
@@ -114,7 +129,7 @@ extern NSString* const RMStoreNotificationStoreError;
     static NSString *productIdentifier = @"test";
     id product = [OCMockObject mockForClass:[SKProduct class]];
     [[[product stub] andReturn:productIdentifier] productIdentifier];
-    [_store.products setObject:product forKey:productIdentifier];
+    (_store.products)[productIdentifier] = product;
     [_store addPayment:productIdentifier];
 }
 
@@ -249,19 +264,437 @@ extern NSString* const RMStoreNotificationStoreError;
 
 #pragma mark SKPaymentTransactionObserver
 
+- (void)testPaymentQueueUpdatedDownloads_Empty
+{ SKIP_IF_VERSION(NSFoundationVersionNumber_iOS_5_1)
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    [_store paymentQueue:queue updatedDownloads:@[]];
+}
+
+- (void)testPaymentQueueUpdatedDownloads_Active
+{ SKIP_IF_VERSION(NSFoundationVersionNumber_iOS_5_1)
+    id download = [self mockDownloadWithState:SKDownloadStateActive];
+    [[[download stub] andReturnValue:OCMOCK_VALUE(0.5f)] progress];
+    
+    id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased downloads:@[download]];
+    NSString *productID = [[transaction payment] productIdentifier];
+    
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [[observer expect] storeDownloadUpdated:[OCMArg checkWithBlock:^BOOL(NSNotification *notification) {
+        SKDownload *returnedDownload = notification.storeDownload;
+        SKPaymentTransaction *returnedTransaction = notification.transaction;
+        NSString *returnedProductID = notification.productIdentifier;
+        float downloadProgress = notification.downloadProgress;
+        STAssertEqualObjects(download, returnedDownload, nil);
+        STAssertEqualObjects(transaction, returnedTransaction, nil);
+        STAssertTrue([productID isEqualToString:returnedProductID], nil);
+        STAssertTrue([download progress] == downloadProgress, nil);
+        return YES;
+    }]];
+    [_store addStoreObserver:observer];
+    
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    
+    [_store paymentQueue:queue updatedDownloads:@[download]];
+    
+    [observer verify];
+}
+
+- (void)testPaymentQueueUpdatedDownloads_Canceled__PurchasedTransaction_SingleDownload
+{ SKIP_IF_VERSION(NSFoundationVersionNumber_iOS_5_1)
+    id download = [self mockDownloadWithState:SKDownloadStateCancelled];
+    
+    id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased downloads:@[download]];
+    NSString *productID = [[transaction payment] productIdentifier];
+    
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    [[queue expect] finishTransaction:transaction];
+    
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [self observer:observer expectStoreDownloadCanceledWithDownload:download];
+    [[observer expect] storePaymentTransactionFailed:[OCMArg checkWithBlock:^BOOL(NSNotification *notification) {
+        SKPaymentTransaction *returnedTransaction = notification.transaction;
+        NSString *returnedProductID = notification.productIdentifier;
+        NSError *error = notification.storeError;
+        STAssertNil(notification.storeDownload, nil);
+        STAssertEqualObjects(transaction, returnedTransaction, nil);
+        STAssertTrue([productID isEqualToString:returnedProductID], nil);
+        STAssertTrue([error.domain isEqualToString:RMStoreErrorDomain], nil);
+        STAssertEquals(error.code, RMStoreErrorCodeDownloadCanceled, nil);
+        return YES;
+    }]];
+    [_store addStoreObserver:observer];
+    
+    [_store paymentQueue:queue updatedDownloads:@[download]];
+    
+    [queue verify];
+    [observer verify];
+}
+
+- (void)testPaymentQueueUpdatedDownloads_Canceled__PurchasedTransaction_MultipleFinishedDownloads
+{ SKIP_IF_VERSION(NSFoundationVersionNumber_iOS_5_1)
+    id download = [self mockDownloadWithState:SKDownloadStateCancelled];
+    id anotherDownload = [self mockDownloadWithState:SKDownloadStateFinished];
+    
+    id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased downloads:@[download, anotherDownload]];
+    NSString *productID = [[transaction payment] productIdentifier];
+    
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    [[queue expect] finishTransaction:transaction];
+    
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [self observer:observer expectStoreDownloadCanceledWithDownload:download];
+    [[observer expect] storePaymentTransactionFailed:[OCMArg checkWithBlock:^BOOL(NSNotification *notification) {
+        SKPaymentTransaction *returnedTransaction = notification.transaction;
+        NSString *returnedProductID = notification.productIdentifier;
+        NSError *error = notification.storeError;
+        STAssertNil(notification.storeDownload, nil);
+        STAssertEqualObjects(transaction, returnedTransaction, nil);
+        STAssertTrue([productID isEqualToString:returnedProductID], nil);
+        STAssertTrue([error.domain isEqualToString:RMStoreErrorDomain], nil);
+        STAssertEquals(error.code, RMStoreErrorCodeDownloadCanceled, nil);
+        return YES;
+    }]];
+    [_store addStoreObserver:observer];
+    
+    [_store paymentQueue:queue updatedDownloads:@[download]];
+    
+    [queue verify];
+    [observer verify];
+}
+
+- (void)testPaymentQueueUpdatedDownloads_Canceled__PurchasedTransaction_PendingDownloads
+{ SKIP_IF_VERSION(NSFoundationVersionNumber_iOS_5_1)
+    id download = [self mockDownloadWithState:SKDownloadStateCancelled];
+    id anotherDownload = [self mockDownloadWithState:SKDownloadStateWaiting];
+    
+    [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased downloads:@[download, anotherDownload]];
+    
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [self observer:observer expectStoreDownloadCanceledWithDownload:download];
+    [_store addStoreObserver:observer];
+    
+    [_store paymentQueue:queue updatedDownloads:@[download]];
+    
+    [queue verify];
+    [observer verify];
+}
+
+- (void)testPaymentQueueUpdatedDownloads_Failed__PurchasedTransaction_SingleDownload
+{ SKIP_IF_VERSION(NSFoundationVersionNumber_iOS_5_1)
+    id download = [self mockDownloadWithState:SKDownloadStateFailed];
+    NSError *error = [NSError errorWithDomain:@"test" code:0 userInfo:nil];
+    [[[download stub] andReturn:error] error];
+    
+    id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased downloads:@[download]];
+    
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    [[queue expect] finishTransaction:transaction];
+    
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [self observer:observer expectStoreDownloadFailedWithDownload:download];
+    [self observer:observer expectStorePaymentTransactionFailedWithTransaction:transaction error:error];
+    [_store addStoreObserver:observer];
+    
+    [_store paymentQueue:queue updatedDownloads:@[download]];
+    
+    [queue verify];
+    [observer verify];
+}
+
+- (void)testPaymentQueueUpdatedDownloads_Failed__PurchasedTransaction_MutipleFinishedDownload
+{ SKIP_IF_VERSION(NSFoundationVersionNumber_iOS_5_1)
+    id download = [self mockDownloadWithState:SKDownloadStateFailed];
+    NSError *error = [NSError errorWithDomain:@"test" code:0 userInfo:nil];
+    [[[download stub] andReturn:error] error];
+    
+    id anotherDownload = [self mockDownloadWithState:SKDownloadStateFinished];
+    
+    id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased downloads:@[download, anotherDownload]];
+    
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    [[queue expect] finishTransaction:transaction];
+    
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [self observer:observer expectStoreDownloadFailedWithDownload:download];
+    [self observer:observer expectStorePaymentTransactionFailedWithTransaction:transaction error:error];
+    [_store addStoreObserver:observer];
+    
+    [_store paymentQueue:queue updatedDownloads:@[download]];
+    
+    [queue verify];
+    [observer verify];
+}
+
+- (void)testPaymentQueueUpdatedDownloads_Failed__PurchasedTransaction_PendingDownloads
+{ SKIP_IF_VERSION(NSFoundationVersionNumber_iOS_5_1)
+    id download = [self mockDownloadWithState:SKDownloadStateFailed];
+    NSError *error = [NSError errorWithDomain:@"test" code:0 userInfo:nil];
+    [[[download stub] andReturn:error] error];
+    
+    id anotherDownload = [self mockDownloadWithState:SKDownloadStateWaiting];
+    
+    [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased downloads:@[download, anotherDownload]];
+    
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [self observer:observer expectStoreDownloadFailedWithDownload:download];
+    [_store addStoreObserver:observer];
+    
+    [_store paymentQueue:queue updatedDownloads:@[download]];
+    
+    [queue verify];
+    [observer verify];
+}
+
+- (void)testPaymentQueueUpdatedDownloads_Finished__PurchasedTransaction_SingleDownload
+{ SKIP_IF_VERSION(NSFoundationVersionNumber_iOS_5_1)
+    id download = [self mockDownloadWithState:SKDownloadStateFinished];
+    
+    id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased downloads:@[download]];
+
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    [[queue expect] finishTransaction:transaction];
+    
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [self observer:observer expectStoreDownloadFinishedWithDownload:download];
+    [self observer:observer expectStorePaymentTransactionFinishedWithTransaction:transaction];
+    [_store addStoreObserver:observer];
+    
+    [_store paymentQueue:queue updatedDownloads:@[download]];
+
+    [queue verify];
+    [observer verify];
+}
+
+- (void)testPaymentQueueUpdatedDownloads_Finished__RestoredTransaction_SingleDownload
+{ SKIP_IF_VERSION(NSFoundationVersionNumber_iOS_5_1)
+    id download = [self mockDownloadWithState:SKDownloadStateFinished];
+    
+    id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStateRestored downloads:@[download]];
+    id originalTransaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased];
+    [[[transaction stub] andReturn:originalTransaction] originalTransaction];
+    
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    [[queue stub] startDownloads:OCMOCK_ANY];
+    [[queue expect] finishTransaction:transaction];
+    
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [self observer:observer expectStoreDownloadFinishedWithDownload:download];
+    [self observer:observer expectStorePaymentTransactionFinishedWithTransaction:transaction];
+    [_store addStoreObserver:observer];
+    [_store paymentQueue:queue updatedTransactions:@[transaction]];
+    
+    [_store paymentQueue:queue updatedDownloads:@[download]];
+    
+    [queue verify];
+    [observer verify];
+}
+
+- (void)testPaymentQueueUpdatedDownloads_Finished__RestoredTransaction_SingleDownload_RestoreCompletedTransactionsFinished
+{ SKIP_IF_VERSION(NSFoundationVersionNumber_iOS_5_1)
+    id download = [self mockDownloadWithState:SKDownloadStateFinished];
+    
+    id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStateRestored downloads:@[download]];
+    id originalTransaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased];
+    [[[transaction stub] andReturn:originalTransaction] originalTransaction];
+    
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    [[queue stub] startDownloads:OCMOCK_ANY];
+    [[queue expect] finishTransaction:transaction];
+    
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [self observer:observer expectStoreDownloadFinishedWithDownload:download];
+    [self observer:observer expectStorePaymentTransactionFinishedWithTransaction:transaction];
+    [[observer expect] storeRestoreTransactionsFinished:OCMOCK_ANY];
+    [_store addStoreObserver:observer];
+    [_store paymentQueue:queue updatedTransactions:@[transaction]];
+    [_store paymentQueueRestoreCompletedTransactionsFinished:queue];
+    
+    [_store paymentQueue:queue updatedDownloads:@[download]];
+    
+    [queue verify];
+    [observer verify];
+}
+
+
+- (void)testPaymentQueueUpdatedDownloads_Finished__PurchasedTransaction_MultipleFinishedDownloads
+{ SKIP_IF_VERSION(NSFoundationVersionNumber_iOS_5_1)
+    id download = [self mockDownloadWithState:SKDownloadStateFinished];
+    id anotherDownload = [self mockDownloadWithState:SKDownloadStateFinished];
+    
+    id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased downloads:@[download, anotherDownload]];
+    
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    [[queue expect] finishTransaction:transaction];
+    
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [self observer:observer expectStoreDownloadFinishedWithDownload:download];
+    [self observer:observer expectStorePaymentTransactionFinishedWithTransaction:transaction];
+    [_store addStoreObserver:observer];
+    
+    [_store paymentQueue:queue updatedDownloads:@[download]];
+    
+    [queue verify];
+    [observer verify];
+}
+
+- (void)testPaymentQueueUpdatedDownloads_Finished__PurchasedTransaction_PendingDownloads
+{ SKIP_IF_VERSION(NSFoundationVersionNumber_iOS_5_1)
+    id download = [self mockDownloadWithState:SKDownloadStateFinished];
+    id anotherDownload = [self mockDownloadWithState:SKDownloadStateWaiting];
+    
+    [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased downloads:@[download, anotherDownload]];
+    
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [self observer:observer expectStoreDownloadFinishedWithDownload:download];
+    [_store addStoreObserver:observer];
+    
+    [_store paymentQueue:queue updatedDownloads:@[download]];
+    
+    [queue verify];
+    [observer verify];
+}
+
+- (void)testPaymentQueueUpdatedDownloads_Paused
+{ SKIP_IF_VERSION(NSFoundationVersionNumber_iOS_5_1)
+    id download = [self mockDownloadWithState:SKDownloadStatePaused];
+    
+    id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased downloads:@[download]];
+    NSString *productID = [[transaction payment] productIdentifier];
+    
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [[observer expect] storeDownloadPaused:[OCMArg checkWithBlock:^BOOL(NSNotification *notification) {
+        SKDownload *returnedDownload = notification.storeDownload;
+        SKPaymentTransaction *returnedTransaction = notification.transaction;
+        NSString *returnedProductID = notification.productIdentifier;
+        STAssertEqualObjects(download, returnedDownload, nil);
+        STAssertEqualObjects(transaction, returnedTransaction, nil);
+        STAssertTrue([productID isEqualToString:returnedProductID], nil);
+        return YES;
+    }]];
+    [_store addStoreObserver:observer];
+
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    
+    [_store paymentQueue:queue updatedDownloads:@[download]];
+    
+    [observer verify];
+}
+
+- (void)testPaymentQueueUpdatedDownloads_Waiting
+{ SKIP_IF_VERSION(NSFoundationVersionNumber_iOS_5_1)
+    id download = [self mockDownloadWithState:SKDownloadStateWaiting];
+    [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased downloads:@[download]];
+    
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [_store addStoreObserver:observer];
+
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    
+    [_store paymentQueue:queue updatedDownloads:@[download]];
+}
+
 - (void)testPaymentQueueUpdatedTransactions_Empty
 {
     id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
     [_store paymentQueue:queue updatedTransactions:@[]];
 }
 
-- (void)testPaymentQueueUpdatedTransactions_Purchased__NoVerificator
+- (void)testPaymentQueueUpdatedTransactions_Purchased__NoVerificator_NoDownloader
 {
     id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
     id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased];
-    [[queue stub] finishTransaction:[OCMArg any]];
+    [[queue expect] finishTransaction:transaction];
 
     [_store paymentQueue:queue updatedTransactions:@[transaction]];
+    
+    [queue verify];
+}
+
+- (void)testPaymentQueueUpdatedTransactions_Purchased__NoVerificator_DownloaderSuccess
+{
+    id downloader = [RMStoreContentDownloaderSuccess new];
+    _store.contentDownloader = downloader;
+    
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased];
+    [[queue expect] finishTransaction:transaction];
+
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [_store addStoreObserver:observer];
+    [self observer:observer expectStoreDownloadFinishedWithTransaction:transaction];
+    [self observer:observer expectStorePaymentTransactionFinishedWithTransaction:transaction];
+    
+    [_store paymentQueue:queue updatedTransactions:@[transaction]];
+    
+    [queue verify];
+    [observer verify];
+}
+
+- (void)testPaymentQueueUpdatedTransactions_Purchased__NoVerificator_DownloaderProgress
+{
+    RMStoreContentDownloaderProgress *downloader = [RMStoreContentDownloaderProgress new];
+    downloader.progress = 0.5;
+    _store.contentDownloader = downloader;
+    
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased];
+    NSString *productID = [[transaction payment] productIdentifier];
+
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [[observer expect] storeDownloadUpdated:[OCMArg checkWithBlock:^BOOL(NSNotification *notification) {
+        SKPaymentTransaction *returnedTransaction = notification.transaction;
+        NSString *returnedProductID = notification.productIdentifier;
+        float downloadProgress = notification.downloadProgress;
+        STAssertEqualObjects(transaction, returnedTransaction, nil);
+        STAssertTrue([productID isEqualToString:returnedProductID], nil);
+        STAssertTrue(downloader.progress == downloadProgress, nil);
+        return YES;
+    }]];
+    [_store addStoreObserver:observer];
+    
+    [_store paymentQueue:queue updatedTransactions:@[transaction]];
+    
+    [observer verify];
+}
+
+- (void)testPaymentQueueUpdatedTransactions_Purchased__NoVerificator_DownloaderFailure
+{
+    RMStoreContentDownloaderFailure *downloader = [RMStoreContentDownloaderFailure new];
+    downloader.error = [NSError errorWithDomain:@"test" code:0 userInfo:nil];
+    _store.contentDownloader = downloader;
+    
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased];
+    [[queue expect] finishTransaction:transaction];
+    
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [_store addStoreObserver:observer];
+    [self observer:observer expectStoreDownloadFailedWithTransaction:transaction error:downloader.error];
+    [self observer:observer expectStorePaymentTransactionFailedWithTransaction:transaction error:downloader.error];
+    
+    [_store paymentQueue:queue updatedTransactions:@[transaction]];
+    
+    [observer verify];
+}
+
+- (void)testPaymentQueueUpdatedTransactions_PurchasedWithDownloads
+{
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    id download = [self mockDownloadWithState:SKDownloadStateWaiting];
+    id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased downloads:@[download]];
+    [[queue expect] startDownloads:[OCMArg checkWithBlock:^BOOL(NSArray *returnedDownloads) {
+        return [returnedDownloads containsObject:download];
+    }]];
+    
+    [_store paymentQueue:queue updatedTransactions:@[transaction]];
+    
+    [queue verify];
 }
 
 - (void)testPaymentQueueUpdatedTransactions_Purchased__NoVerificator_Blocks
@@ -272,7 +705,7 @@ extern NSString* const RMStoreNotificationStoreError;
 
     id product = [OCMockObject mockForClass:[SKProduct class]];
     [[[product stub] andReturn:@"test"] productIdentifier];
-    [_store.products setObject:product forKey:@"test"];
+    (_store.products)[@"test"] = product;
     [_store addPayment:@"test" success:^(SKPaymentTransaction *transaction) {
         STAssertEqualObjects(transaction, originalTransaction, @"");
     } failure:^(SKPaymentTransaction *transaction, NSError *error) {
@@ -284,7 +717,7 @@ extern NSString* const RMStoreNotificationStoreError;
 
 - (void)testPaymentQueueUpdatedTransactions_Purchased__VerificatorSuccess
 {
-    id verificator = [[RMStoreReceiptVerificatorSuccess alloc] init];
+    id verificator = [RMStoreReceiptVerificatorSuccess new];
     _store.receiptVerificator = verificator;
     id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
     id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased];
@@ -297,7 +730,7 @@ extern NSString* const RMStoreNotificationStoreError;
 
 - (void)testPaymentQueueUpdatedTransactions_Purchased__VerificatorFailure
 {
-    id verificator = [[RMStoreReceiptVerificatorFailure alloc] init];
+    id verificator = [RMStoreReceiptVerificatorFailure new];
     _store.receiptVerificator = verificator;
     id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
     id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased];
@@ -318,7 +751,7 @@ extern NSString* const RMStoreNotificationStoreError;
     [_store paymentQueue:queue updatedTransactions:@[transaction]];
 }
 
-- (void)testPaymentQueueUpdatedTransactions_Restored__NoVerificator
+- (void)testPaymentQueueUpdatedTransactions_Restored__NoVerificator_NoDownloader
 {
     id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
     id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStateRestored];
@@ -332,6 +765,95 @@ extern NSString* const RMStoreNotificationStoreError;
     [_store paymentQueue:queue updatedTransactions:@[transaction]];
     
     [[NSNotificationCenter defaultCenter] removeObserver:observerMock];
+}
+
+- (void)testPaymentQueueUpdatedTransactions_Restored__NoVerificator_DownloaderSuccess
+{
+    id downloader = [RMStoreContentDownloaderSuccess new];
+    _store.contentDownloader = downloader;
+    
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStateRestored];
+    id originalTransaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased];
+    [[[transaction stub] andReturn:originalTransaction] originalTransaction];
+    [[queue expect] finishTransaction:transaction];
+    
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [_store addStoreObserver:observer];
+    [self observer:observer expectStoreDownloadFinishedWithTransaction:transaction];
+    [self observer:observer expectStorePaymentTransactionFinishedWithTransaction:transaction];
+    
+    [_store paymentQueue:queue updatedTransactions:@[transaction]];
+    
+    [queue verify];
+    [observer verify];
+}
+
+- (void)testPaymentQueueUpdatedTransactions_Restored__NoVerificator_DownloaderProgress
+{
+    RMStoreContentDownloaderProgress *downloader = [RMStoreContentDownloaderProgress new];
+    downloader.progress = 0.5;
+    _store.contentDownloader = downloader;
+    
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStateRestored];
+    id originalTransaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased];
+    [[[transaction stub] andReturn:originalTransaction] originalTransaction];
+    NSString *productID = [[transaction payment] productIdentifier];
+    
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [[observer expect] storeDownloadUpdated:[OCMArg checkWithBlock:^BOOL(NSNotification *notification) {
+        SKPaymentTransaction *returnedTransaction = notification.transaction;
+        NSString *returnedProductID = notification.productIdentifier;
+        float downloadProgress = notification.downloadProgress;
+        STAssertEqualObjects(transaction, returnedTransaction, nil);
+        STAssertTrue([productID isEqualToString:returnedProductID], nil);
+        STAssertTrue(downloader.progress == downloadProgress, nil);
+        return YES;
+    }]];
+    [_store addStoreObserver:observer];
+    
+    [_store paymentQueue:queue updatedTransactions:@[transaction]];
+    
+    [observer verify];
+}
+
+- (void)testPaymentQueueUpdatedTransactions_Restored__NoVerificator_DownloaderFailure
+{
+    RMStoreContentDownloaderFailure *downloader = [RMStoreContentDownloaderFailure new];
+    downloader.error = [NSError errorWithDomain:@"test" code:0 userInfo:nil];
+    _store.contentDownloader = downloader;
+    
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStateRestored];
+    id originalTransaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased];
+    [[[transaction stub] andReturn:originalTransaction] originalTransaction];
+    [[queue expect] finishTransaction:transaction];
+    
+    id observer = [OCMockObject mockForProtocol:@protocol(RMStoreObserver)];
+    [_store addStoreObserver:observer];
+    [self observer:observer expectStoreDownloadFailedWithTransaction:transaction error:downloader.error];
+    [self observer:observer expectStorePaymentTransactionFailedWithTransaction:transaction error:downloader.error];
+    
+    [_store paymentQueue:queue updatedTransactions:@[transaction]];
+    
+    [observer verify];
+}
+
+- (void)testPaymentQueueUpdatedTransactions_RestoredWithDownloads
+{
+    id queue = [OCMockObject mockForClass:[SKPaymentQueue class]];
+    id download = [self mockDownloadWithState:SKDownloadStateWaiting];
+    id transaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStateRestored downloads:@[download]];
+    id originalTransaction = [self mockPaymentTransactionWithState:SKPaymentTransactionStatePurchased];
+    [[[transaction stub] andReturn:originalTransaction] originalTransaction];
+    [[queue expect] startDownloads:[OCMArg checkWithBlock:^BOOL(NSArray *returnedDownloads) {
+        return [returnedDownloads containsObject:download];
+    }]];
+    
+    [_store paymentQueue:queue updatedTransactions:@[transaction]];
+    
+    [queue verify];
 }
 
 - (void)testPaymentQueueUpdatedTransactions_Restored__ExpectRMSKRestoreTransactionsFinished
@@ -427,7 +949,7 @@ extern NSString* const RMStoreNotificationStoreError;
 
     id product = [OCMockObject mockForClass:[SKProduct class]];
     [[[product stub] andReturn:@"test"] productIdentifier];
-    [_store.products setObject:product forKey:@"test"];
+    (_store.products)[@"test"] = product;
     [_store addPayment:@"test" success:^(SKPaymentTransaction *transaction) {
         STFail(@"");
     } failure:^(SKPaymentTransaction *transaction, NSError *error) {
@@ -494,7 +1016,7 @@ extern NSString* const RMStoreNotificationStoreError;
 {
     NSError *originalError = [NSError errorWithDomain:@"test" code:0 userInfo:nil];
     id observerMock = [self observerMockForNotification:RMSKRestoreTransactionsFailed checkUserInfoWithBlock:^BOOL(NSDictionary *userInfo) {
-        NSError *error = [userInfo objectForKey:RMStoreNotificationStoreError];
+        NSError *error = userInfo[RMStoreNotificationStoreError];
         STAssertEqualObjects(error, originalError, @"");
         return YES;
     }];
@@ -510,7 +1032,7 @@ extern NSString* const RMStoreNotificationStoreError;
 {
     NSError *originalError = [NSError errorWithDomain:@"test" code:0 userInfo:nil];
     id observerMock = [self observerMockForNotification:RMSKRestoreTransactionsFailed checkUserInfoWithBlock:^BOOL(NSDictionary *userInfo) {
-        NSError *error = [userInfo objectForKey:RMStoreNotificationStoreError];
+        NSError *error = userInfo[RMStoreNotificationStoreError];
         STAssertEqualObjects(error, originalError, @"");
         return YES;
     }];
@@ -545,7 +1067,7 @@ extern NSString* const RMStoreNotificationStoreError;
 { SKIP_IF_VERSION(NSFoundationVersionNumber_iOS_6_1)
     NSError *originalError = [NSError errorWithDomain:@"test" code:0 userInfo:nil];
     id observerMock = [self observerMockForNotification:RMSKRefreshReceiptFailed checkUserInfoWithBlock:^BOOL(NSDictionary *userInfo) {
-        NSError *error = [userInfo objectForKey:RMStoreNotificationStoreError];
+        NSError *error = userInfo[RMStoreNotificationStoreError];
         STAssertEqualObjects(error, originalError, @"");
         return YES;
     }];
@@ -583,7 +1105,7 @@ extern NSString* const RMStoreNotificationStoreError;
     __block BOOL executed;
     NSError *originalError = [NSError errorWithDomain:@"test" code:0 userInfo:nil];
     id observerMock = [self observerMockForNotification:RMSKRefreshReceiptFailed checkUserInfoWithBlock:^BOOL(NSDictionary *userInfo) {
-        NSError *error = [userInfo objectForKey:RMStoreNotificationStoreError];
+        NSError *error = userInfo[RMStoreNotificationStoreError];
         STAssertEqualObjects(error, originalError, @"");
         return YES;
     }];
@@ -607,7 +1129,109 @@ extern NSString* const RMStoreNotificationStoreError;
 
 #pragma mark Private
 
+- (void)observer:(id)observer expectStoreDownloadFailedWithDownload:(SKDownload*)download
+{
+    NSError *error = download.error;
+    SKPaymentTransaction *transaction = download.transaction;
+    NSString *productID = transaction.payment.productIdentifier;
+    [[observer expect] storeDownloadFailed:[OCMArg checkWithBlock:^BOOL(NSNotification *notification) {
+        STAssertEqualObjects(download, notification.storeDownload, nil);
+        STAssertEqualObjects(transaction, notification.transaction, nil);
+        STAssertTrue([productID isEqualToString:notification.productIdentifier], nil);
+        STAssertEqualObjects(error, notification.storeError, nil);
+        return YES;
+    }]];
+}
+
+- (void)observer:(id)observer expectStoreDownloadFailedWithTransaction:(SKPaymentTransaction*)transaction error:(NSError*)error
+{
+    NSString *productID = transaction.payment.productIdentifier;
+    [[observer expect] storeDownloadFailed:[OCMArg checkWithBlock:^BOOL(NSNotification *notification) {
+        STAssertNil(notification.storeDownload, nil);
+        STAssertEqualObjects(transaction, notification.transaction, nil);
+        STAssertTrue([productID isEqualToString:notification.productIdentifier], nil);
+        STAssertEqualObjects(error, notification.storeError, nil);
+        return YES;
+    }]];
+}
+
+- (void)observer:(id)observer expectStoreDownloadFinishedWithDownload:(SKDownload*)download
+{
+    SKPaymentTransaction *transaction = download.transaction;
+    NSString *productID = transaction.payment.productIdentifier;
+    [[observer expect] storeDownloadFinished:[OCMArg checkWithBlock:^BOOL(NSNotification *notification) {
+        STAssertEqualObjects(download, notification.storeDownload, nil);
+        STAssertEqualObjects(transaction, notification.transaction, nil);
+        STAssertTrue([productID isEqualToString:notification.productIdentifier], nil);
+        STAssertNil(notification.storeError, nil);
+        return YES;
+    }]];
+}
+
+- (void)observer:(id)observer expectStoreDownloadFinishedWithTransaction:(SKPaymentTransaction*)transaction
+{
+    NSString *productID = transaction.payment.productIdentifier;
+    [[observer expect] storeDownloadFinished:[OCMArg checkWithBlock:^BOOL(NSNotification *notification) {
+        STAssertNil(notification.storeDownload, nil);
+        STAssertEqualObjects(transaction, notification.transaction, nil);
+        STAssertTrue([productID isEqualToString:notification.productIdentifier], nil);
+        STAssertNil(notification.storeError, nil);
+        return YES;
+    }]];
+}
+
+
+- (void)observer:(id)observer expectStoreDownloadCanceledWithDownload:(SKDownload*)download
+{
+    SKPaymentTransaction *transaction = download.transaction;
+    NSString *productID = transaction.payment.productIdentifier;
+    [[observer expect] storeDownloadCanceled:[OCMArg checkWithBlock:^BOOL(NSNotification *notification) {
+        STAssertEqualObjects(download, notification.storeDownload, nil);
+        STAssertEqualObjects(transaction, notification.transaction, nil);
+        STAssertTrue([productID isEqualToString:notification.productIdentifier], nil);
+        STAssertNil(notification.storeError, nil);
+        return YES;
+    }]];
+}
+
+- (void)observer:(id)observer expectStorePaymentTransactionFailedWithTransaction:(SKPaymentTransaction *)transaction error:(NSError*)error
+{
+    NSString *productID = transaction.payment.productIdentifier;
+    [[observer expect] storePaymentTransactionFailed:[OCMArg checkWithBlock:^BOOL(NSNotification *notification) {
+        STAssertNil(notification.storeDownload, nil);
+        STAssertEqualObjects(transaction, notification.transaction, nil);
+        STAssertTrue([productID isEqualToString:notification.productIdentifier], nil);
+        STAssertEqualObjects(error, notification.storeError, nil);
+        return YES;
+    }]];
+}
+
+- (void)observer:(id)observer expectStorePaymentTransactionFinishedWithTransaction:(SKPaymentTransaction *)transaction
+{
+    NSString *productID = transaction.payment.productIdentifier;
+    [[observer expect] storePaymentTransactionFinished:[OCMArg checkWithBlock:^BOOL(NSNotification *notification) {
+        STAssertNil(notification.storeDownload, nil);
+        STAssertEqualObjects(transaction, notification.transaction, nil);
+        STAssertTrue([productID isEqualToString:notification.productIdentifier], nil);
+        STAssertNil(notification.storeError, nil);
+        return YES;
+    }]];
+}
+
+- (id)mockDownloadWithState:(SKDownloadState)state
+{
+    id download = [OCMockObject mockForClass:[SKDownload class]];
+    [[[download stub] andReturn:@"content"] contentIdentifier];
+    [[[download stub] andReturnValue:@(state)] downloadState];
+    return download;
+}
+
 - (id)mockPaymentTransactionWithState:(SKPaymentTransactionState)state
+{
+    return [self mockPaymentTransactionWithState:state downloads:@[]];
+}
+
+- (id)mockPaymentTransactionWithState:(SKPaymentTransactionState)state downloads:(NSArray*)downloads
 {
     id transaction = [OCMockObject mockForClass:[SKPaymentTransaction class]];
     [[[transaction stub] andReturnValue:@(state)] transactionState];
@@ -617,6 +1241,11 @@ extern NSString* const RMStoreNotificationStoreError;
     id payment = [OCMockObject mockForClass:[SKPayment class]];
     [[[payment stub] andReturn:@"test"] productIdentifier];
     [[[transaction stub] andReturn:payment] payment];
+    [[[transaction stub] andReturn:downloads] downloads];
+    for (id download in downloads)
+    {
+        [[[download stub] andReturn:transaction] transaction];
+    }
     return transaction;
 }
 
@@ -644,6 +1273,33 @@ extern NSString* const RMStoreNotificationStoreError;
 - (void)storePaymentTransactionFinished:(NSNotification*)notification {}
 - (void)storeRestoreTransactionsFailed:(NSNotification*)notification {}
 - (void)storeRestoreTransactionsFinished:(NSNotification*)notification {}
+
+@end
+
+@implementation RMStoreContentDownloaderSuccess
+
+- (void)downloadContentForTransaction:(SKPaymentTransaction *)transaction success:(void (^)())successBlock progress:(void (^)(float))progressBlock failure:(void (^)(NSError *))failureBlock
+{
+    if (successBlock) successBlock();
+}
+
+@end
+
+@implementation RMStoreContentDownloaderProgress
+
+- (void)downloadContentForTransaction:(SKPaymentTransaction *)transaction success:(void (^)())successBlock progress:(void (^)(float))progressBlock failure:(void (^)(NSError *))failureBlock
+{
+    if (progressBlock) progressBlock(self.progress);
+}
+
+@end
+
+@implementation RMStoreContentDownloaderFailure
+
+- (void)downloadContentForTransaction:(SKPaymentTransaction *)transaction success:(void (^)())successBlock progress:(void (^)(float))progressBlock failure:(void (^)(NSError *))failureBlock
+{
+    if (failureBlock) failureBlock(self.error);
+}
 
 @end
 
